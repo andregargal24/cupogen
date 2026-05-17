@@ -18,8 +18,7 @@ app.post('/api/buscar-imagenes', async (req, res) => {
   if(!ANTHROPIC_KEY) return res.status(500).json({ error: 'API key no configurada' });
 
   try {
-    // Paso 1: Claude busca en la web
-    const r1 = await fetch('https://api.anthropic.com/v1/messages', {
+    const response = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: {
         'Content-Type':      'application/json',
@@ -28,33 +27,32 @@ app.post('/api/buscar-imagenes', async (req, res) => {
         'anthropic-beta':    'web-search-2025-03-05'
       },
       body: JSON.stringify({
-        model:      'claude-sonnet-4-5',
-        max_tokens: 500,
+        model:      'claude-haiku-4-5-20251001',
+        max_tokens: 800,
         tools: [{ type: 'web_search_20250305', name: 'web_search' }],
-        system: `Cuando busques imágenes de un hotel, devuelve ÚNICAMENTE este JSON sin texto extra:
+        system: `Busca imágenes del hotel y responde SOLO con este JSON (sin texto extra, sin markdown):
 {"urls":["url1","url2","url3","url4","url5","url6"]}
-Las URLs deben ser imágenes directas (jpg, jpeg, png, webp) del hotel.`,
+URLs deben ser imágenes directas jpg/jpeg/png/webp del hotel.`,
         messages: [{
           role:    'user',
-          content: `Busca 6 imágenes del hotel "${hotel}". Busca en tripadvisor.com, booking.com, o el sitio oficial. Devuelve solo el JSON con las URLs de imágenes directas.`
+          content: `Encuentra 6 URLs de imágenes del hotel: ${hotel}`
         }]
       })
     });
 
-    const d1 = await r1.json();
-    if(d1.error) return res.status(502).json({ error: d1.error.message });
+    const data = await response.json();
+    if(data.error) return res.status(502).json({ error: data.error.message });
 
-    // Construir historial de mensajes
+    // Manejar flujo multi-turno si Claude usó web_search
     let messages = [
-      { role: 'user', content: `Busca 6 imágenes del hotel "${hotel}". Busca en tripadvisor.com, booking.com, o el sitio oficial. Devuelve solo el JSON con las URLs de imágenes directas.` },
-      { role: 'assistant', content: d1.content }
+      { role: 'user', content: `Encuentra 6 URLs de imágenes del hotel: ${hotel}` },
+      { role: 'assistant', content: data.content }
     ];
 
     let finalText = '';
 
-    if(d1.stop_reason === 'tool_use') {
-      // Procesar resultados de la búsqueda
-      const toolResults = d1.content
+    if(data.stop_reason === 'tool_use') {
+      const toolResults = data.content
         .filter(b => b.type === 'tool_use')
         .map(b => ({ type: 'tool_result', tool_use_id: b.id, content: 'OK' }));
 
@@ -69,12 +67,11 @@ Las URLs deben ser imágenes directas (jpg, jpeg, png, webp) del hotel.`,
           'anthropic-beta':    'web-search-2025-03-05'
         },
         body: JSON.stringify({
-          model:      'claude-sonnet-4-5',
-          max_tokens: 500,
+          model:      'claude-haiku-4-5-20251001',
+          max_tokens: 400,
           tools: [{ type: 'web_search_20250305', name: 'web_search' }],
-          system: `Devuelve ÚNICAMENTE este JSON sin texto extra ni markdown:
-{"urls":["url1","url2","url3","url4","url5","url6"]}
-Con URLs directas de imágenes (jpg, jpeg, png, webp) del hotel encontradas en la búsqueda.`,
+          system: `Responde SOLO con JSON sin texto extra:
+{"urls":["url1","url2","url3","url4","url5","url6"]}`,
           messages
         })
       });
@@ -83,13 +80,11 @@ Con URLs directas de imágenes (jpg, jpeg, png, webp) del hotel encontradas en l
       if(d2.error) return res.status(502).json({ error: d2.error.message });
       for(const b of (d2.content || [])) if(b.type === 'text') finalText += b.text;
     } else {
-      for(const b of (d1.content || [])) if(b.type === 'text') finalText += b.text;
+      for(const b of (data.content || [])) if(b.type === 'text') finalText += b.text;
     }
 
-    // Extraer URLs del texto
+    // Parsear respuesta
     finalText = finalText.replace(/```json|```/g, '').trim();
-
-    // Intentar parsear JSON
     const jsonMatch = finalText.match(/\{[\s\S]*?\}/);
     if(jsonMatch) {
       try {
@@ -99,7 +94,7 @@ Con URLs directas de imágenes (jpg, jpeg, png, webp) del hotel encontradas en l
       } catch(e) {}
     }
 
-    // Fallback: extraer URLs directas del texto
+    // Fallback: regex para URLs de imágenes
     const urlRegex = /https?:\/\/[^\s"',<>\]]+\.(?:jpg|jpeg|png|webp)(?:\?[^\s"',<>\]]*)?/gi;
     const urls = [...new Set(finalText.match(urlRegex) || [])].slice(0, 6);
     if(urls.length) return res.json({ urls });
