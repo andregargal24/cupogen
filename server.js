@@ -8,10 +8,8 @@ const PORT = process.env.PORT || 3000;
 app.use(cors({ origin: '*' }));
 app.use(express.json());
 
-// Health check
 app.get('/', (req, res) => res.json({ status: 'ok', service: 'cupon-backend' }));
 
-// ── Proxy → Anthropic API ──────────────────────────────────
 app.post('/api/buscar-imagenes', async (req, res) => {
   const hotel = (req.body.hotel || '').trim();
   if(!hotel) return res.status(400).json({ error: 'Falta el nombre del hotel' });
@@ -20,47 +18,93 @@ app.post('/api/buscar-imagenes', async (req, res) => {
   if(!ANTHROPIC_KEY) return res.status(500).json({ error: 'API key no configurada' });
 
   try {
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
+    // Paso 1: Claude busca en la web
+    const r1 = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: {
-        'Content-Type':         'application/json',
-        'x-api-key':            ANTHROPIC_KEY,
-        'anthropic-version':    '2023-06-01',
-        'anthropic-beta':       'web-search-2025-03-05'
+        'Content-Type':      'application/json',
+        'x-api-key':         ANTHROPIC_KEY,
+        'anthropic-version': '2023-06-01',
+        'anthropic-beta':    'web-search-2025-03-05'
       },
       body: JSON.stringify({
         model:      'claude-sonnet-4-5',
-        max_tokens: 1024,
+        max_tokens: 2048,
         tools: [{ type: 'web_search_20250305', name: 'web_search' }],
-        system: `Eres un asistente especializado en encontrar imágenes de hoteles.
-Usa web_search para buscar fotos del hotel en sitios como tripadvisor.com, booking.com, hotels.com, marriott.com, hilton.com, riu.com, iberostar.com, palladiumhotelgroup.com.
-Responde ÚNICAMENTE con JSON válido, sin texto extra, sin markdown, sin backticks:
+        system: `Cuando busques imágenes de un hotel, devuelve ÚNICAMENTE este JSON sin texto extra:
 {"urls":["url1","url2","url3","url4","url5","url6"]}
-Las URLs deben ser imágenes directas (jpg, jpeg, png, webp) de alta resolución del hotel.`,
+Las URLs deben ser imágenes directas (jpg, jpeg, png, webp) del hotel.`,
         messages: [{
           role:    'user',
-          content: `Busca 6 imágenes del hotel: ${hotel}. Solo devuelve el JSON.`
+          content: `Busca 6 imágenes del hotel "${hotel}". Busca en tripadvisor.com, booking.com, o el sitio oficial. Devuelve solo el JSON con las URLs de imágenes directas.`
         }]
       })
     });
 
-    const data = await response.json();
+    const d1 = await r1.json();
+    if(d1.error) return res.status(502).json({ error: d1.error.message });
 
-    if(data.error) return res.status(502).json({ error: data.error.message });
+    // Construir historial de mensajes
+    let messages = [
+      { role: 'user', content: `Busca 6 imágenes del hotel "${hotel}". Busca en tripadvisor.com, booking.com, o el sitio oficial. Devuelve solo el JSON con las URLs de imágenes directas.` },
+      { role: 'assistant', content: d1.content }
+    ];
 
-    // Extraer texto de todos los bloques
-    let text = '';
-    for(const block of (data.content || [])){
-      if(block.type === 'text') text += block.text;
+    let finalText = '';
+
+    if(d1.stop_reason === 'tool_use') {
+      // Procesar resultados de la búsqueda
+      const toolResults = d1.content
+        .filter(b => b.type === 'tool_use')
+        .map(b => ({ type: 'tool_result', tool_use_id: b.id, content: 'OK' }));
+
+      messages.push({ role: 'user', content: toolResults });
+
+      const r2 = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'Content-Type':      'application/json',
+          'x-api-key':         ANTHROPIC_KEY,
+          'anthropic-version': '2023-06-01',
+          'anthropic-beta':    'web-search-2025-03-05'
+        },
+        body: JSON.stringify({
+          model:      'claude-sonnet-4-5',
+          max_tokens: 1024,
+          tools: [{ type: 'web_search_20250305', name: 'web_search' }],
+          system: `Devuelve ÚNICAMENTE este JSON sin texto extra ni markdown:
+{"urls":["url1","url2","url3","url4","url5","url6"]}
+Con URLs directas de imágenes (jpg, jpeg, png, webp) del hotel encontradas en la búsqueda.`,
+          messages
+        })
+      });
+
+      const d2 = await r2.json();
+      if(d2.error) return res.status(502).json({ error: d2.error.message });
+      for(const b of (d2.content || [])) if(b.type === 'text') finalText += b.text;
+    } else {
+      for(const b of (d1.content || [])) if(b.type === 'text') finalText += b.text;
     }
 
-    // Limpiar y parsear JSON
-    text = text.replace(/```json|```/g, '').trim();
-    const match = text.match(/\{[\s\S]*\}/);
-    if(!match) return res.status(502).json({ error: 'No se encontraron imágenes' });
+    // Extraer URLs del texto
+    finalText = finalText.replace(/```json|```/g, '').trim();
 
-    const parsed = JSON.parse(match[0]);
-    res.json({ urls: parsed.urls || [] });
+    // Intentar parsear JSON
+    const jsonMatch = finalText.match(/\{[\s\S]*?\}/);
+    if(jsonMatch) {
+      try {
+        const parsed = JSON.parse(jsonMatch[0]);
+        const urls = (parsed.urls || []).filter(u => u && u.startsWith('http'));
+        if(urls.length) return res.json({ urls });
+      } catch(e) {}
+    }
+
+    // Fallback: extraer URLs directas del texto
+    const urlRegex = /https?:\/\/[^\s"',<>\]]+\.(?:jpg|jpeg|png|webp)(?:\?[^\s"',<>\]]*)?/gi;
+    const urls = [...new Set(finalText.match(urlRegex) || [])].slice(0, 6);
+    if(urls.length) return res.json({ urls });
+
+    return res.status(502).json({ error: 'No se encontraron imágenes para ese hotel' });
 
   } catch(e) {
     console.error('Error:', e);
