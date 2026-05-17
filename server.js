@@ -29,7 +29,7 @@ app.post('/api/buscar-imagenes', async (req, res) => {
       },
       body: JSON.stringify({
         model:      'claude-sonnet-4-5',
-        max_tokens: 2048,
+        max_tokens: 500,
         tools: [{ type: 'web_search_20250305', name: 'web_search' }],
         system: `Cuando busques imágenes de un hotel, devuelve ÚNICAMENTE este JSON sin texto extra:
 {"urls":["url1","url2","url3","url4","url5","url6"]}
@@ -70,7 +70,7 @@ Las URLs deben ser imágenes directas (jpg, jpeg, png, webp) del hotel.`,
         },
         body: JSON.stringify({
           model:      'claude-sonnet-4-5',
-          max_tokens: 1024,
+          max_tokens: 500,
           tools: [{ type: 'web_search_20250305', name: 'web_search' }],
           system: `Devuelve ÚNICAMENTE este JSON sin texto extra ni markdown:
 {"urls":["url1","url2","url3","url4","url5","url6"]}
