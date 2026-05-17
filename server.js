@@ -14,101 +14,61 @@ app.post('/api/buscar-imagenes', async (req, res) => {
   const hotel = (req.body.hotel || '').trim();
   if(!hotel) return res.status(400).json({ error: 'Falta el nombre del hotel' });
 
-  const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
-  if(!ANTHROPIC_KEY) return res.status(500).json({ error: 'API key no configurada' });
-
   try {
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
+    // Buscar en Bing Images (sin API key, scraping del HTML)
+    const query = encodeURIComponent(`${hotel} hotel`);
+    const bingUrl = `https://www.bing.com/images/search?q=${query}&form=HDRSC2&first=1&tsc=ImageHoverTitle`;
+
+    const r = await fetch(bingUrl, {
       headers: {
-        'Content-Type':      'application/json',
-        'x-api-key':         ANTHROPIC_KEY,
-        'anthropic-version': '2023-06-01',
-        'anthropic-beta':    'web-search-2025-03-05'
-      },
-      body: JSON.stringify({
-        model:      'claude-haiku-4-5-20251001',
-        max_tokens: 1000,
-        tools: [{ type: 'web_search_20250305', name: 'web_search' }],
-        messages: [{
-          role:    'user',
-          content: `Search for: ${hotel} hotel photos site:tripadvisor.com OR site:booking.com OR site:hotels.com`
-        }]
-      })
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml',
+        'Accept-Language': 'es-MX,es;q=0.9,en;q=0.8',
+      }
     });
 
-    const data = await response.json();
-    if(data.error) return res.status(502).json({ error: data.error.message });
+    const html = await r.text();
 
-    // Extraer URLs de imágenes directamente de los tool_result
+    // Extraer URLs de imágenes del JSON embebido en el HTML de Bing
+    const imgRegex = /"murl":"(https?:\/\/[^"]+\.(?:jpg|jpeg|png|webp)[^"]*)"/gi;
     const urls = [];
-    const imgRegex = /https?:\/\/[^\s"',<>\]\)]+\.(?:jpg|jpeg|png|webp)(?:\?[^\s"',<>\]\)]*)?/gi;
-
-    for(const block of (data.content || [])) {
-      // Buscar en web_search_tool_result
-      if(block.type === 'web_search_tool_result' || block.type === 'tool_result') {
-        const content = JSON.stringify(block);
-        const found = content.match(imgRegex) || [];
-        urls.push(...found);
-      }
-      // Buscar en server_tool_use (contiene los resultados crudos)
-      if(block.type === 'server_tool_use') {
-        const content = JSON.stringify(block);
-        const found = content.match(imgRegex) || [];
-        urls.push(...found);
-      }
-      // También buscar en texto
-      if(block.type === 'text') {
-        const found = block.text.match(imgRegex) || [];
-        urls.push(...found);
-      }
+    let match;
+    while((match = imgRegex.exec(html)) !== null && urls.length < 9) {
+      try {
+        const url = match[1].replace(/\\u002f/g, '/').replace(/\\\//g, '/');
+        if(url.startsWith('http')) urls.push(url);
+      } catch(e) {}
     }
 
-    // Filtrar duplicados y URLs válidas de imágenes de hoteles
-    const filtered = [...new Set(urls)]
-      .filter(u => !u.includes('logo') && !u.includes('icon') && !u.includes('flag') && !u.includes('avatar'))
-      .filter(u => u.length > 30)
-      .slice(0, 6);
+    const unique = [...new Set(urls)].slice(0, 6);
+    console.log(`Hotel: ${hotel} — imágenes encontradas: ${unique.length}`);
 
-    console.log('URLs encontradas:', filtered.length, filtered);
+    if(unique.length) return res.json({ urls: unique });
 
-    if(filtered.length) return res.json({ urls: filtered });
-
-    // Si no hay imágenes en tool_result, hacer segunda búsqueda más específica
-    const r2 = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type':      'application/json',
-        'x-api-key':         ANTHROPIC_KEY,
-        'anthropic-version': '2023-06-01',
-        'anthropic-beta':    'web-search-2025-03-05'
-      },
-      body: JSON.stringify({
-        model:      'claude-haiku-4-5-20251001',
-        max_tokens: 1000,
-        tools: [{ type: 'web_search_20250305', name: 'web_search' }],
-        messages: [{
-          role:    'user',
-          content: `Find the official website of "${hotel}" hotel and list the direct URLs of hotel room and pool photos from that website. List each URL on a new line.`
-        }]
-      })
+    // Fallback: DuckDuckGo
+    const ddgUrl = `https://duckduckgo.com/?q=${query}&iax=images&ia=images`;
+    const r2 = await fetch(ddgUrl, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' }
     });
+    const html2 = await r2.text();
+    const token = html2.match(/vqd=([\d-]+)/)?.[1];
 
-    const d2 = await r2.json();
-    const urls2 = [];
-    for(const block of (d2.content || [])) {
-      const content = JSON.stringify(block);
-      const found = content.match(imgRegex) || [];
-      urls2.push(...found);
+    if(token) {
+      const ddgImgUrl = `https://duckduckgo.com/i.js?l=us-en&o=json&q=${query}&vqd=${token}&f=,,,&p=1`;
+      const r3 = await fetch(ddgImgUrl, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0',
+          'Referer': 'https://duckduckgo.com'
+        }
+      });
+      const data = await r3.json();
+      const ddgUrls = (data.results || [])
+        .map(r => r.image)
+        .filter(u => u && u.startsWith('http'))
+        .slice(0, 6);
+
+      if(ddgUrls.length) return res.json({ urls: ddgUrls });
     }
-
-    const filtered2 = [...new Set(urls2)]
-      .filter(u => !u.includes('logo') && !u.includes('icon') && u.length > 30)
-      .slice(0, 6);
-
-    console.log('URLs segunda búsqueda:', filtered2.length);
-
-    if(filtered2.length) return res.json({ urls: filtered2 });
 
     return res.status(502).json({ error: 'No se encontraron imágenes. Intenta subir una manualmente.' });
 
