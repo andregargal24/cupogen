@@ -28,35 +28,31 @@ app.post('/api/buscar-imagenes', async (req, res) => {
       },
       body: JSON.stringify({
         model:      'claude-haiku-4-5-20251001',
-        max_tokens: 800,
+        max_tokens: 1000,
         tools: [{ type: 'web_search_20250305', name: 'web_search' }],
-        system: `Busca imágenes del hotel y responde SOLO con este JSON (sin texto extra, sin markdown):
-{"urls":["url1","url2","url3","url4","url5","url6"]}
-URLs deben ser imágenes directas jpg/jpeg/png/webp del hotel.`,
         messages: [{
           role:    'user',
-          content: `Encuentra 6 URLs de imágenes del hotel: ${hotel}`
+          content: `Search for photos of hotel "${hotel}". Find direct image URLs (jpg, jpeg, png) from tripadvisor, booking.com, or the hotel's official website. Return ONLY a JSON array like this with no other text: {"urls":["https://...jpg","https://...jpg","https://...jpg","https://...jpg","https://...jpg","https://...jpg"]}`
         }]
       })
     });
 
     const data = await response.json();
+    console.log('API response stop_reason:', data.stop_reason);
+    console.log('Content blocks:', JSON.stringify(data.content?.map(b => ({type: b.type, text: b.text?.slice(0,200)})), null, 2));
+
     if(data.error) return res.status(502).json({ error: data.error.message });
 
-    // Manejar flujo multi-turno si Claude usó web_search
-    let messages = [
-      { role: 'user', content: `Encuentra 6 URLs de imágenes del hotel: ${hotel}` },
-      { role: 'assistant', content: data.content }
-    ];
-
-    let finalText = '';
-
+    // Si Claude usó web_search, continuamos la conversación
     if(data.stop_reason === 'tool_use') {
-      const toolResults = data.content
-        .filter(b => b.type === 'tool_use')
-        .map(b => ({ type: 'tool_result', tool_use_id: b.id, content: 'OK' }));
-
-      messages.push({ role: 'user', content: toolResults });
+      const messages = [
+        { role: 'user', content: `Search for photos of hotel "${hotel}". Find direct image URLs (jpg, jpeg, png) from tripadvisor, booking.com, or the hotel's official website. Return ONLY a JSON array like this with no other text: {"urls":["https://...jpg","https://...jpg","https://...jpg","https://...jpg","https://...jpg","https://...jpg"]}` },
+        { role: 'assistant', content: data.content },
+        { role: 'user', content: data.content
+            .filter(b => b.type === 'tool_use')
+            .map(b => ({ type: 'tool_result', tool_use_id: b.id, content: 'Search completed' }))
+        }
+      ];
 
       const r2 = await fetch('https://api.anthropic.com/v1/messages', {
         method: 'POST',
@@ -68,24 +64,39 @@ URLs deben ser imágenes directas jpg/jpeg/png/webp del hotel.`,
         },
         body: JSON.stringify({
           model:      'claude-haiku-4-5-20251001',
-          max_tokens: 400,
+          max_tokens: 500,
           tools: [{ type: 'web_search_20250305', name: 'web_search' }],
-          system: `Responde SOLO con JSON sin texto extra:
-{"urls":["url1","url2","url3","url4","url5","url6"]}`,
           messages
         })
       });
 
       const d2 = await r2.json();
-      if(d2.error) return res.status(502).json({ error: d2.error.message });
-      for(const b of (d2.content || [])) if(b.type === 'text') finalText += b.text;
-    } else {
-      for(const b of (data.content || [])) if(b.type === 'text') finalText += b.text;
+      console.log('Round 2 content:', JSON.stringify(d2.content?.map(b => ({type: b.type, text: b.text?.slice(0,300)})), null, 2));
+
+      let text = '';
+      for(const b of (d2.content || [])) if(b.type === 'text') text += b.text;
+
+      // Extraer URLs del JSON
+      const jsonMatch = text.replace(/```json|```/g,'').match(/\{[\s\S]*?\}/);
+      if(jsonMatch) {
+        try {
+          const parsed = JSON.parse(jsonMatch[0]);
+          const urls = (parsed.urls || []).filter(u => u && u.startsWith('http'));
+          if(urls.length) return res.json({ urls });
+        } catch(e) { console.log('JSON parse error:', e.message); }
+      }
+
+      // Fallback regex
+      const urlRegex = /https?:\/\/[^\s"',<>\]\)]+\.(?:jpg|jpeg|png|webp)(?:\?[^\s"',<>\]\)]*)?/gi;
+      const urls = [...new Set(text.match(urlRegex) || [])].slice(0, 6);
+      console.log('Regex URLs found:', urls);
+      if(urls.length) return res.json({ urls });
     }
 
-    // Parsear respuesta
-    finalText = finalText.replace(/```json|```/g, '').trim();
-    const jsonMatch = finalText.match(/\{[\s\S]*?\}/);
+    // Si respondió directo sin tool_use
+    let text = '';
+    for(const b of (data.content || [])) if(b.type === 'text') text += b.text;
+    const jsonMatch = text.replace(/```json|```/g,'').match(/\{[\s\S]*?\}/);
     if(jsonMatch) {
       try {
         const parsed = JSON.parse(jsonMatch[0]);
@@ -93,11 +104,6 @@ URLs deben ser imágenes directas jpg/jpeg/png/webp del hotel.`,
         if(urls.length) return res.json({ urls });
       } catch(e) {}
     }
-
-    // Fallback: regex para URLs de imágenes
-    const urlRegex = /https?:\/\/[^\s"',<>\]]+\.(?:jpg|jpeg|png|webp)(?:\?[^\s"',<>\]]*)?/gi;
-    const urls = [...new Set(finalText.match(urlRegex) || [])].slice(0, 6);
-    if(urls.length) return res.json({ urls });
 
     return res.status(502).json({ error: 'No se encontraron imágenes para ese hotel' });
 
